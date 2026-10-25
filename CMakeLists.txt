@@ -25,6 +25,7 @@ target_compile_options(project_warnings
 
 add_library(order_book
     src/order_book.cpp
+    src/trade_recorder.cpp
 )
 
 target_include_directories(order_book

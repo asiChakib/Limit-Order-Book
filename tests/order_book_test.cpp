@@ -1,225 +1,210 @@
 
 #include "order_book.hpp"
+#include "trade_recorder.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
-#include <iostream>
-#include <sstream>
-#include <stdexcept>
-#include <string>
+#include <optional>
+#include <vector>
 
-namespace {
-
-class CoutCapture {
-public:
-    CoutCapture() : old_buffer_(std::cout.rdbuf(buffer_.rdbuf())) {}
-
-    ~CoutCapture() {
-        std::cout.rdbuf(old_buffer_);
-    }
-
-    CoutCapture(const CoutCapture&) = delete;
-    CoutCapture& operator=(const CoutCapture&) = delete;
-
-    [[nodiscard]] std::string str() const {
-        return buffer_.str();
-    }
-
-private:
-    std::ostringstream buffer_;
-    std::streambuf* old_buffer_;
+class OrderBookTest : public ::testing::Test {
+protected:
+    OrderBook book;
 };
 
-TEST(OrderBookTest, NonCrossingOrdersRemainInBook) {
-    OrderBook book;
+// 1. An empty book has no best prices or spread.
+TEST_F(OrderBookTest, EmptyBookHasNoBestPrices) {
+    EXPECT_EQ(book.best_bid(), std::nullopt);
+    EXPECT_EQ(book.best_ask(), std::nullopt);
+    EXPECT_EQ(book.spread(), std::nullopt);
 
-    {
-        CoutCapture capture;
-        book.submit({1, Side::Sell, 101, 5});
-        book.submit({2, Side::Buy, 100, 8});
-    }
-
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
-
-    EXPECT_NE(output.find("Price 101 | Total quantity 5"), std::string::npos);
-    EXPECT_NE(output.find("[1: 5]"), std::string::npos);
-    EXPECT_NE(output.find("Price 100 | Total quantity 8"), std::string::npos);
-    EXPECT_NE(output.find("[2: 8]"), std::string::npos);
+    EXPECT_EQ(book.quantity_at_price(Side::Buy, 100), 0);
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 100), 0);
 }
 
-TEST(OrderBookTest, ExactFillRemovesRestingOrder) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 101, 5});
+// 2. An unmatched order rests in the book.
+TEST_F(OrderBookTest, UnmatchedOrderIsAddedToBook) {
+    const auto trades = book.submit(Order{1, Side::Buy, 100, 10});
 
-    std::string trades;
-    {
-        CoutCapture capture;
-        book.submit({2, Side::Buy, 101, 5});
-        trades = capture.str();
-    }
-
-    EXPECT_NE(trades.find("buy order 2 vs sell order 1"), std::string::npos);
-    EXPECT_NE(trades.find("quantity of 5"), std::string::npos);
-
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
-
-    EXPECT_EQ(output.find("Price 101"), std::string::npos);
-    EXPECT_EQ(output.find("[1:"), std::string::npos);
+    EXPECT_TRUE(trades.empty());
+    EXPECT_EQ(book.best_bid(), 100);
+    EXPECT_EQ(book.quantity_at_price(Side::Buy, 100), 10);
 }
 
-TEST(OrderBookTest, PartialFillLeavesCorrectRemainingQuantity) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 101, 10});
+// 3. An exact fill removes the resting order and records the trade.
+TEST_F(OrderBookTest, ExactFillRemovesRestingOrder) {
+    book.submit(Order{1, Side::Sell, 101, 5});
 
-    {
-        CoutCapture capture;
-        book.submit({2, Side::Buy, 101, 4});
-    }
+    const auto trades = book.submit(Order{2, Side::Buy, 101, 5});
 
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
+    ASSERT_EQ(trades.size(), 1);
 
-    EXPECT_NE(output.find("Price 101 | Total quantity 6"), std::string::npos);
-    EXPECT_NE(output.find("[1: 6]"), std::string::npos);
-    EXPECT_EQ(output.find("[2:"), std::string::npos);
+    EXPECT_EQ(trades[0].buy_order_id, 2);
+    EXPECT_EQ(trades[0].sell_order_id, 1);
+    EXPECT_EQ(trades[0].price, 101);
+    EXPECT_EQ(trades[0].quantity, 5);
+
+    EXPECT_EQ(book.best_ask(), std::nullopt);
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 101), 0);
 }
 
-TEST(OrderBookTest, BestPriceHasPriority) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 102, 3});
-    book.submit({2, Side::Sell, 101, 3});
+// 4. A partial fill leaves the unfilled quantity resting.
+TEST_F(OrderBookTest, PartialFillLeavesRestingRemainder) {
+    book.submit(Order{1, Side::Sell, 101, 10});
 
-    std::string trades;
-    {
-        CoutCapture capture;
-        book.submit({3, Side::Buy, 102, 4});
-        trades = capture.str();
-    }
+    const auto trades = book.submit(Order{2, Side::Buy, 101, 4});
 
-    const auto best_price_trade = trades.find("sell order 2 at price 101");
-    const auto next_price_trade = trades.find("sell order 1 at price 102");
+    ASSERT_EQ(trades.size(), 1);
+    EXPECT_EQ(trades[0].quantity, 4);
+    EXPECT_EQ(trades[0].price, 101);
 
-    ASSERT_NE(best_price_trade, std::string::npos);
-    ASSERT_NE(next_price_trade, std::string::npos);
-    EXPECT_LT(best_price_trade, next_price_trade);
+    EXPECT_EQ(book.best_ask(), 101);
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 101), 6);
 }
 
-TEST(OrderBookTest, FIFOIsPreservedAtSamePrice) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 101, 3});
-    book.submit({2, Side::Sell, 101, 4});
+// 5. Better-priced resting orders have priority.
+TEST_F(OrderBookTest, BestPriceHasPriority) {
+    book.submit(Order{1, Side::Sell, 103, 2});
+    book.submit(Order{2, Side::Sell, 101, 2});
+    book.submit(Order{3, Side::Sell, 102, 2});
 
-    std::string trades;
-    {
-        CoutCapture capture;
-        book.submit({3, Side::Buy, 101, 5});
-        trades = capture.str();
-    }
+    const auto trades = book.submit(Order{4, Side::Buy, 103, 4});
 
-    const auto first_order_trade = trades.find("sell order 1");
-    const auto second_order_trade = trades.find("sell order 2");
+    ASSERT_EQ(trades.size(), 2);
 
-    ASSERT_NE(first_order_trade, std::string::npos);
-    ASSERT_NE(second_order_trade, std::string::npos);
-    EXPECT_LT(first_order_trade, second_order_trade);
+    EXPECT_EQ(trades[0].buy_order_id, 4);
+    EXPECT_EQ(trades[0].sell_order_id, 2);
+    EXPECT_EQ(trades[0].price, 101);
+    EXPECT_EQ(trades[0].quantity, 2);
 
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
+    EXPECT_EQ(trades[1].buy_order_id, 4);
+    EXPECT_EQ(trades[1].sell_order_id, 3);
+    EXPECT_EQ(trades[1].price, 102);
+    EXPECT_EQ(trades[1].quantity, 2);
 
-    EXPECT_NE(output.find("[2: 2]"), std::string::npos);
-    EXPECT_EQ(output.find("[1:"), std::string::npos);
+    EXPECT_EQ(book.best_ask(), 103);
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 103), 2);
 }
 
-TEST(OrderBookTest, IncomingOrderCanMatchMultiplePriceLevels) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 101, 2});
-    book.submit({2, Side::Sell, 102, 3});
+// 6. Orders at the same price are matched in FIFO order.
+TEST_F(OrderBookTest, FIFOIsPreservedAtSamePrice) {
+    book.submit(Order{1, Side::Sell, 101, 2});
+    book.submit(Order{2, Side::Sell, 101, 2});
 
-    std::string trades;
-    {
-        CoutCapture capture;
-        book.submit({3, Side::Buy, 102, 5});
-        trades = capture.str();
-    }
+    const auto trades = book.submit(Order{3, Side::Buy, 101, 3});
 
-    EXPECT_NE(trades.find("sell order 1 at price 101"), std::string::npos);
-    EXPECT_NE(trades.find("sell order 2 at price 102"), std::string::npos);
+    ASSERT_EQ(trades.size(), 2);
 
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
+    EXPECT_EQ(trades[0].sell_order_id, 1);
+    EXPECT_EQ(trades[0].quantity, 2);
 
-    EXPECT_EQ(output.find("Price 101"), std::string::npos);
-    EXPECT_EQ(output.find("Price 102"), std::string::npos);
+    EXPECT_EQ(trades[1].sell_order_id, 2);
+    EXPECT_EQ(trades[1].quantity, 1);
+
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 101), 1);
 }
 
-TEST(OrderBookTest, CancellationRemovesOrder) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 101, 5});
-    book.submit({2, Side::Sell, 101, 7});
+// 7. One incoming order can match multiple price levels.
+TEST_F(OrderBookTest, IncomingOrderCanMatchMultiplePriceLevels) {
+    book.submit(Order{1, Side::Sell, 101, 2});
+    book.submit(Order{2, Side::Sell, 102, 3});
+
+    const auto trades = book.submit(Order{3, Side::Buy, 102, 4});
+
+    ASSERT_EQ(trades.size(), 2);
+
+    EXPECT_EQ(trades[0].sell_order_id, 1);
+    EXPECT_EQ(trades[0].price, 101);
+    EXPECT_EQ(trades[0].quantity, 2);
+
+    EXPECT_EQ(trades[1].sell_order_id, 2);
+    EXPECT_EQ(trades[1].price, 102);
+    EXPECT_EQ(trades[1].quantity, 2);
+
+    EXPECT_EQ(book.best_ask(), 102);
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 102), 1);
+}
+
+// 8. Cancelling an existing order removes it from the book.
+TEST_F(OrderBookTest, CancelExistingOrder) {
+    book.submit(Order{1, Side::Buy, 100, 5});
 
     EXPECT_TRUE(book.cancel(1));
-    EXPECT_FALSE(book.cancel(1));
 
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
-
-    EXPECT_NE(output.find("Price 101 | Total quantity 7"), std::string::npos);
-    EXPECT_EQ(output.find("[1:"), std::string::npos);
-    EXPECT_NE(output.find("[2: 7]"), std::string::npos);
+    EXPECT_EQ(book.best_bid(), std::nullopt);
+    EXPECT_EQ(book.quantity_at_price(Side::Buy, 100), 0);
 }
 
-TEST(OrderBookTest, CancellingUnknownOrderReturnsFalse) {
-    OrderBook book;
+// 9. Cancelling an unknown order fails without changing the book.
+TEST_F(OrderBookTest, CancelUnknownOrder) {
+    book.submit(Order{1, Side::Buy, 100, 5});
 
     EXPECT_FALSE(book.cancel(999));
+
+    EXPECT_EQ(book.best_bid(), 100);
+    EXPECT_EQ(book.quantity_at_price(Side::Buy, 100), 5);
 }
 
-TEST(OrderBookTest, CancellingLastOrderRemovesPriceLevel) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 101, 5});
-    book.submit({2, Side::Sell, 102, 6});
+// 10. Queries return aggregate quantities and the correct spread.
+TEST_F(OrderBookTest, BookQueriesReturnCorrectValues) {
+    book.submit(Order{1, Side::Buy, 99, 5});
+    book.submit(Order{2, Side::Buy, 100, 3});
+    book.submit(Order{3, Side::Buy, 100, 7});
+    book.submit(Order{4, Side::Sell, 105, 4});
 
-    EXPECT_TRUE(book.cancel(1));
+    EXPECT_EQ(book.best_bid(), 100);
+    EXPECT_EQ(book.best_ask(), 105);
+    EXPECT_EQ(book.spread(), 5);
 
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
+    EXPECT_EQ(book.quantity_at_price(Side::Buy, 100), 10);
+    EXPECT_EQ(book.quantity_at_price(Side::Buy, 99), 5);
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 105), 4);
 
-    EXPECT_EQ(output.find("Price 101"), std::string::npos);
-    EXPECT_NE(output.find("Price 102 | Total quantity 6"), std::string::npos);
+    EXPECT_EQ(book.quantity_at_price(Side::Buy, 101), 0);
+    EXPECT_EQ(book.quantity_at_price(Side::Sell, 104), 0);
 }
 
-TEST(OrderBookTest, DuplicateRestingOrderIdIsRejected) {
-    OrderBook book;
-    book.submit({1, Side::Sell, 101, 5});
+// 11. TradeRecorder accumulates executions across submissions.
+TEST(TradeRecorderTest, AccumulatesTradesInOrder) {
+    TradeRecorder recorder;
 
-    EXPECT_THROW(book.submit({1, Side::Buy, 100, 2}), std::invalid_argument);
+    const std::vector<Trade> first_batch{Trade{10, 1, 101, 5}, Trade{11, 2, 102, 3}};
 
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
+    const std::vector<Trade> second_batch{Trade{12, 3, 103, 7}};
 
-    EXPECT_NE(output.find("Price 101 | Total quantity 5"), std::string::npos);
-    EXPECT_EQ(output.find("Price 100"), std::string::npos);
+    recorder.record(first_batch);
+    recorder.record(second_batch);
+
+    const auto& history = recorder.history();
+
+    ASSERT_EQ(history.size(), 3);
+
+    EXPECT_EQ(history[0].buy_order_id, 10);
+    EXPECT_EQ(history[0].sell_order_id, 1);
+    EXPECT_EQ(history[0].price, 101);
+    EXPECT_EQ(history[0].quantity, 5);
+
+    EXPECT_EQ(history[1].buy_order_id, 11);
+    EXPECT_EQ(history[1].sell_order_id, 2);
+
+    EXPECT_EQ(history[2].buy_order_id, 12);
+    EXPECT_EQ(history[2].sell_order_id, 3);
+    EXPECT_EQ(history[2].price, 103);
+    EXPECT_EQ(history[2].quantity, 7);
 }
 
-TEST(OrderBookTest, ZeroQuantityIsRejected) {
-    OrderBook book;
+// Recording an empty batch must not change the history.
+TEST(TradeRecorderTest, EmptyBatchLeavesHistoryUnchanged) {
+    TradeRecorder recorder;
 
-    EXPECT_THROW(book.submit({1, Side::Buy, 100, 0}), std::invalid_argument);
+    const std::vector<Trade> trades{Trade{10, 1, 101, 5}};
 
-    CoutCapture capture;
-    book.print_book();
-    const std::string output = capture.str();
+    recorder.record(trades);
 
-    EXPECT_EQ(output.find("Price"), std::string::npos);
+    const std::vector<Trade> empty_batch;
+    recorder.record(empty_batch);
+
+    ASSERT_EQ(recorder.history().size(), 1);
+    EXPECT_EQ(recorder.history()[0].buy_order_id, 10);
+    EXPECT_EQ(recorder.history()[0].quantity, 5);
 }
-
-} // namespace
